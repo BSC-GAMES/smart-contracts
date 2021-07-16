@@ -1,6 +1,4 @@
-pragma solidity ^0.4.23;
-
-
+pragma solidity >=0.5.0 <0.6.0;
 /*
  * @dev Provides information about the current execution context, including the
  * sender of the transaction and its data. While these are generally available
@@ -364,14 +362,9 @@ contract ERC20 is Context, IERC20 {
     mapping (address => mapping (address => uint256)) private _allowances;
 
     uint256 private _totalSupply;
-    uint256 private _cap;
-    
-     constructor() public {
-    _cap = 100000000*10**18;
-    _balances[msg.sender] = _totalSupply;
-     }
-
-    /**
+    uint256 private _cap = 100_000_000 ether;
+     
+      /**
      * @dev See {IERC20-totalSupply}.
      */
     function totalSupply() public view returns (uint256) {
@@ -382,10 +375,10 @@ contract ERC20 is Context, IERC20 {
     /**
     *@dev Returns the cap on the token's total supply.
     */
-  function cap() public view returns (uint256) {
+  function MaxTotalSupply() public view returns (uint256) {
         return _cap;
     }
-    
+
     /**
      * @dev See {IERC20-balanceOf}.
      */
@@ -511,9 +504,10 @@ contract ERC20 is Context, IERC20 {
      *
      * - `to` cannot be the zero address.
      */
-    function _mint(address account, uint256 amount) internal {
+   
+     function _mint(address account, uint256 amount) internal {
         require(account != address(0), "ERC20: mint to the zero address");
-        require(_totalSupply.add(amount) <= cap(), "Cannot mint more than cap");
+        require(_totalSupply.add(amount) <= _cap, "Cannot mint more than cap");
         _totalSupply = _totalSupply.add(amount);
         _balances[account] = _balances[account].add(amount);
         emit Transfer(address(0), account, amount);
@@ -644,15 +638,7 @@ library WithPeriod {
 
 contract BSCGTOKEN is Ownable, ERC20, ERC20Detailed {
     using SafeMath for uint256;
-
-    // who can mine?
-    mapping(address => bool) public miner;
-
-    // this is for mining..
-    uint256 lastVolume = 0;
-    uint256 lastTime = 0;
-    uint256 public price = 0.01 ether;
-
+    
     struct FreezeCounter {
         uint256 period;
         uint256 newlyFrozen;
@@ -679,7 +665,6 @@ contract BSCGTOKEN is Ownable, ERC20, ERC20Detailed {
     mapping(uint256 => uint256) public frozenYesterday;
 
     uint256 public periodDuration = 86400;
-
     uint8 public devFee = 5;
     uint256 public totalForDev = 0;
     bool public allowTotalWithdraw = true;
@@ -704,41 +689,34 @@ contract BSCGTOKEN is Ownable, ERC20, ERC20Detailed {
     // when dividend changes
     event DividendValue(uint256 amount, uint256 period);
 
-    // event DebugNumber(string what, uint256 num);
-
-    // when price of the mining changed
-    event NewPrice(uint256 price);
-
-    modifier onlyMiner {
-        require(miner[msg.sender], "only available to miner");
-        _;
-    }
+    event DebugNumber(string what, uint256 num);
 
     constructor(uint256 _periodDuration)
         public
         ERC20Detailed("BSCGTOKEN", "BSCG", 18)
     {
         periodDuration = _periodDuration;
-        // STRICTLY NO PREMINE!
-        // _mint(msg.sender, 200_000_000 ether);
+        // PREMINE!
+        _mint(msg.sender, 100_000_000 ether);
+    }
+    
+    function setPeriodDuration (uint256 _periodDuration)
+        public onlyOwner {
+        periodDuration = _periodDuration;
     }
 
     function disableTotalWithdraw() public onlyOwner {
         allowTotalWithdraw = false;
     }
 
-    // donation..
-    function() external payable {
-        totalForDev = totalForDev.add(msg.value);
-    }
 
     // alpha release helper function.. this function is needed
     function totalWithdraw() public onlyOwner {
         require(allowTotalWithdraw, "total withdraw disabled");
         address(uint160(owner())).transfer(address(this).balance);
     }
-
-    function devWithdraw(uint256 request) public {
+    
+     function devWithdraw(uint256 request) public {
         require(
             request < totalForDev,
             "dev should not withdraw greater than what he have"
@@ -754,37 +732,6 @@ contract BSCGTOKEN is Ownable, ERC20, ERC20Detailed {
         emit DividendValue(dividendValue[period], period);
     }
 
-    function setMiner(address who, bool isMiner) public onlyOwner {
-        miner[who] = isMiner;
-    }
-
-    function mining(
-        address who,
-        uint256 betAmount,
-        address upline
-    ) public onlyMiner {
-        uint256 period = WithPeriod.get(periodDuration, 0, true);
-
-        if (period > lastTime) {
-            lastTime = period;
-            price = price.add(lastVolume.div(50000));
-            emit NewPrice(price);
-
-            lastVolume = betAmount;
-        } else {
-            lastVolume = lastVolume.add(betAmount);
-        }
-
-        uint256 mined = betAmount.mul(10**18).div(price);
-
-        _mint(who, mined);
-
-        _mint(owner(), mined.div(10));
-
-        if (upline != address(0)) {
-            _mint(upline, mined.div(25));
-        }
-    }
 
     function getPeriod(uint8 offset, bool forward)
         public
@@ -854,8 +801,8 @@ contract BSCGTOKEN is Ownable, ERC20, ERC20Detailed {
         uint256 today = WithPeriod.get(periodDuration, 0, true);
         uint256 yesterday = WithPeriod.get(periodDuration, 1, true);
         uint256 priorYesterday = WithPeriod.get(periodDuration, 2, true);
-
-        // emit DebugNumber("dividend value", dividendValue[yesterday]);
+        
+        emit DebugNumber("dividend value", dividendValue[yesterday]);
 
         require(dividendValue[yesterday] > 0, "we have nothing to claim");
 
@@ -880,8 +827,8 @@ contract BSCGTOKEN is Ownable, ERC20, ERC20Detailed {
             counter.period = today;
         }
 
-        // emit DebugNumber("frozen", counter.cummulative);
-        // emit DebugNumber("network frozen yesterday", frozenYesterday[yesterday]);
+        emit DebugNumber("frozen", counter.cummulative);
+        emit DebugNumber("network frozen yesterday", frozenYesterday[yesterday]);
 
         uint256 mine = counter.cummulative.mul(dividendValue[yesterday]).div(
             frozenYesterday[yesterday]
