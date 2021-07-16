@@ -1,614 +1,846 @@
-pragma solidity ^0.4.24;
+pragma solidity >=0.5.0 <0.6.0;
+/*
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with GSN meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+contract Context {
+    // Empty internal constructor, to prevent people from mistakenly deploying
+    // an instance of this contract, which should be used via inheritance.
+    constructor () internal { }
+    // solhint-disable-previous-line no-empty-blocks
 
-// * BSCGame - fair games that pay . Version 5.
-//
-// * Uses hybrid commit-reveal + block hash random number generation that is immune
-//   to tampering by players, house and miners. Apart from being fully transparent,
-//   this also allows arbitrarily high bets.
-//
-
-contract BSCGame {
-    /// *** Constants section
-
-    // Each bet is deducted 1% in favour of the house, but no less than some minimum.
-    // The lower bound is dictated by gas costs of the settleBet transaction, providing
-    // headroom for up to 10 Gwei prices.
-    uint constant HOUSE_EDGE_PERCENT = 1;
-    uint constant HOUSE_EDGE_MINIMUM_AMOUNT = 0.0003 ether;
-
-    // Bets lower than this amount do not participate in jackpot rolls (and are
-    // not deducted JACKPOT_FEE).
-    uint constant MIN_JACKPOT_BET = 0.1 ether;
-
-    // Chance to win jackpot (currently 0.1%) and fee deducted into jackpot fund.
-    uint constant JACKPOT_MODULO = 1000;
-    uint constant JACKPOT_FEE = 0.001 ether;
-
-    // There is minimum and maximum bets.
-    uint constant MIN_BET = 0.05 ether;
-    uint constant MAX_AMOUNT = 300000 ether;
-
-    // Modulo is a number of equiprobable outcomes in a game:
-    //  - 2 for coin flip
-    //  - 6 for dice
-    //  - 6*6 = 36 for double dice
-    //  - 100 for bnbroll
-    //  - 37 for roulette
-    //  etc.
-    // It's called so because 256-bit entropy is treated like a huge integer and
-    // the remainder of its division by modulo is considered bet outcome.
-    uint constant MAX_MODULO = 100;
-
-    // For modulos below this threshold rolls are checked against a bit mask,
-    // thus allowing betting on any combination of outcomes. For example, given
-    // modulo 6 for dice, 101000 mask (base-2, big endian) means betting on
-    // 4 and 6; for games with modulos higher than threshold (bnbroll), a simple
-    // limit is used, allowing betting on any outcome in [0, N) range.
-    //
-    // The specific value is dictated by the fact that 256-bit intermediate
-    // multiplication result allows implementing population count efficiently
-    // for numbers that are up to 42 bits, and 40 is the highest multiple of
-    // eight below 42.
-    uint constant MAX_MASK_MODULO = 40;
-
-    // This is a check on bet mask overflow.
-    uint constant MAX_BET_MASK = 2 ** MAX_MASK_MODULO;
-
-    // EVM BLOCKHASH opcode can query no further than 256 blocks into the
-    // past. Given that settleBet uses block hash of placeBet as one of
-    // complementary entropy sources, we cannot process bets older than this
-    // threshold. On rare occasions BSCGame croupier may fail to invoke
-    // settleBet in this timespan due to technical issues or extreme BSC
-    // congestion; such bets can be refunded via invoking refundBet.
-    uint constant BET_EXPIRATION_BLOCKS = 250;
-
-    // Some deliberately invalid address to initialize the secret signer with.
-    // Forces maintainers to invoke setSecretSigner before processing any bets.
-    address constant DUMMY_ADDRESS = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
-
-    // Standard contract ownership transfer.
-    address public owner;
-    address private nextOwner;
-
-    // Adjustable max bet profit. Used to cap bets against dynamic odds.
-    uint public maxProfit;
-
-    // The address corresponding to a private key used to sign placeBet commits.
-    address public secretSigner;
-
-    // Accumulated jackpot fund.
-    uint128 public jackpotSize;
-
-    // Funds that are locked in potentially winning bets. Prevents contract from
-    // committing to bets it cannot pay out.
-    uint128 public lockedInBets;
-
-    // A structure representing a single bet.
-    struct Bet {
-        // Wager amount in wei.
-        uint amount;
-        // Modulo of a game.
-        uint8 modulo;
-        // Number of winning outcomes, used to compute winning payment (* modulo/rollUnder),
-        // and used instead of mask for games with modulo > MAX_MASK_MODULO.
-        uint8 rollUnder;
-        // Block number of placeBet tx.
-        uint40 placeBlockNumber;
-        // Bit mask representing winning bet outcomes (see MAX_MASK_MODULO comment).
-        uint40 mask;
-        // Address of a gambler, used to pay out winning bets.
-        address gambler;
+    function _msgSender() internal view returns (address) {
+        return msg.sender;
     }
 
-    // Mapping from commits to all currently active & processed bets.
-    mapping (uint => Bet) bets;
+    function _msgData() internal view returns (bytes memory) {
+        this; // silence state mutability warning without generating bytecode - see https://github.com/ethereum/solidity/issues/2691
+        return msg.data;
+    }
+}
 
-    // Croupier account.
-    address public croupier;
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+contract Ownable is Context {
+    address private _owner;
 
-    // Events that are issued to make statistic recovery easier.
-    event FailedPayment(address indexed beneficiary, uint amount);
-    event Payment(address indexed beneficiary, uint amount);
-    event JackpotPayment(address indexed beneficiary, uint amount);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
-    // This event is emitted in placeBet to record commit in the logs.
-    event Commit(uint commit);
-
-    // Constructor. Deliberately does not take any parameters.
-    constructor () public {
-        owner = msg.sender;
-        secretSigner = DUMMY_ADDRESS;
-        croupier = DUMMY_ADDRESS;
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor () internal {
+        address msgSender = _msgSender();
+        _owner = msgSender;
+        emit OwnershipTransferred(address(0), msgSender);
     }
 
-    // Standard modifier on methods invokable only by contract owner.
-    modifier onlyOwner {
-        require (msg.sender == owner, "OnlyOwner methods called by non-owner.");
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        require(isOwner(), "Ownable: caller is not the owner");
         _;
     }
 
-    // Standard modifier on methods invokable only by contract owner.
-    modifier onlyCroupier {
-        require (msg.sender == croupier, "OnlyCroupier methods called by non-croupier.");
-        _;
+    /**
+     * @dev Returns true if the caller is the current owner.
+     */
+    function isOwner() public view returns (bool) {
+        return _msgSender() == _owner;
     }
 
-    // Standard contract ownership transfer implementation,
-    function approveNextOwner(address _nextOwner) external onlyOwner {
-        require (_nextOwner != owner, "Cannot approve current owner.");
-        nextOwner = _nextOwner;
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public onlyOwner {
+        emit OwnershipTransferred(_owner, address(0));
+        _owner = address(0);
     }
 
-    function acceptNextOwner() external {
-        require (msg.sender == nextOwner, "Can only accept preapproved new owner.");
-        owner = nextOwner;
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public onlyOwner {
+        _transferOwnership(newOwner);
     }
 
-    // Fallback function deliberately left empty. It's primary use case
-    // is to top up the bank roll.
-    function () public payable {
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     */
+    function _transferOwnership(address newOwner) internal {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        emit OwnershipTransferred(_owner, newOwner);
+        _owner = newOwner;
+    }
+}
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP. Does not include
+ * the optional functions; to access them see {ERC20Detailed}.
+ */
+interface IERC20 {
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `recipient`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address recipient, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `sender` to `recipient` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+/**
+ * @dev Wrappers over Solidity's arithmetic operations with added overflow
+ * checks.
+ *
+ * Arithmetic operations in Solidity wrap on overflow. This can easily result
+ * in bugs, because programmers usually assume that an overflow raises an
+ * error, which is the standard behavior in high level programming languages.
+ * `SafeMath` restores this intuition by reverting the transaction when an
+ * operation overflows.
+ *
+ * Using this library instead of the unchecked operations eliminates an entire
+ * class of bugs, so it's recommended to use it always.
+ */
+library SafeMath {
+    /**
+     * @dev Returns the addition of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `+` operator.
+     *
+     * Requirements:
+     * - Addition cannot overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+
+        return c;
     }
 
-    // See comment for "secretSigner" variable.
-    function setSecretSigner(address newSecretSigner) external onlyOwner {
-        secretSigner = newSecretSigner;
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
     }
 
-    // Change the croupier address.
-    function setCroupier(address newCroupier) external onlyOwner {
-        croupier = newCroupier;
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     * - Subtraction cannot overflow.
+     *
+     * _Available since v2.4.0._
+     */
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+
+        return c;
     }
 
-    // Change max bet reward. Setting this to zero effectively disables betting.
-    function setMaxProfit(uint _maxProfit) public onlyOwner {
-        require (_maxProfit < MAX_AMOUNT, "maxProfit should be a sane number.");
-        maxProfit = _maxProfit;
-    }
-
-    // This function is used to bump up the jackpot fund. Cannot be used to lower it.
-    function increaseJackpot(uint increaseAmount) external onlyOwner {
-        require (increaseAmount <= address(this).balance, "Increase amount larger than balance.");
-        require (jackpotSize + lockedInBets + increaseAmount <= address(this).balance, "Not enough funds.");
-        jackpotSize += uint128(increaseAmount);
-    }
-
-    // Funds withdrawal to cover costs of BSCGame operation.
-    function withdrawFunds(address beneficiary, uint withdrawAmount) external onlyOwner {
-        require (withdrawAmount <= address(this).balance, "Increase amount larger than balance.");
-        require (jackpotSize + lockedInBets + withdrawAmount <= address(this).balance, "Not enough funds.");
-        sendFunds(beneficiary, withdrawAmount, withdrawAmount);
-    }
-
-    // Contract may be destroyed only when there are no ongoing bets,
-    // either settled or refunded. All funds are transferred to contract owner.
-    function kill() external onlyOwner {
-        require (lockedInBets == 0, "All bets should be processed (settled or refunded) before self-destruct.");
-        selfdestruct(owner);
-    }
-
-    /// *** Betting logic
-
-    // Bet states:
-    //  amount == 0 && gambler == 0 - 'clean' (can place a bet)
-    //  amount != 0 && gambler != 0 - 'active' (can be settled or refunded)
-    //  amount == 0 && gambler != 0 - 'processed' (can clean storage)
-    //
-    //  NOTE: Storage cleaning is not implemented in this contract version; it will be added
-    //        with the next upgrade to prevent polluting BSC state with expired bets.
-
-    // Bet placing transaction - issued by the player.
-    //  betMask         - bet outcomes bit mask for modulo <= MAX_MASK_MODULO,
-    //                    [0, betMask) for larger modulos.
-    //  modulo          - game modulo.
-    //  commitLastBlock - number of the maximum block where "commit" is still considered valid.
-    //  commit          - Keccak256 hash of some secret "reveal" random number, to be supplied
-    //                    by the BSCGame croupier bot in the settleBet transaction. Supplying
-    //                    "commit" ensures that "reveal" cannot be changed behind the scenes
-    //                    after placeBet have been mined.
-    //  r, s            - components of ECDSA signature of (commitLastBlock, commit). v is
-    //                    guaranteed to always equal 27.
-    //
-    // Commit, being essentially random 256-bit number, is used as a unique bet identifier in
-    // the 'bets' mapping.
-    //
-    // Commits are signed with a block limit to ensure that they are used at most once - otherwise
-    // it would be possible for a miner to place a bet with a known commit/reveal pair and tamper
-    // with the blockhash. Croupier guarantees that commitLastBlock will always be not greater than
-    // placeBet block number plus BET_EXPIRATION_BLOCKS. See whitepaper for details.
-    function placeBet(uint betMask, uint modulo, uint commitLastBlock, uint commit, bytes32 r, bytes32 s) external payable {
-        // Check that the bet is in 'clean' state.
-        Bet storage bet = bets[commit];
-        require (bet.gambler == address(0), "Bet should be in a 'clean' state.");
-
-        // Validate input data ranges.
-        uint amount = msg.value;
-        require (modulo > 1 && modulo <= MAX_MODULO, "Modulo should be within range.");
-        require (amount >= MIN_BET && amount <= MAX_AMOUNT, "Amount should be within range.");
-        require (betMask > 0 && betMask < MAX_BET_MASK, "Mask should be within range.");
-
-        // Check that commit is valid - it has not expired and its signature is valid.
-        require (block.number <= commitLastBlock, "Commit has expired.");
-        bytes32 signatureHash = keccak256(abi.encodePacked(uint40(commitLastBlock), commit));
-        require (secretSigner == ecrecover(signatureHash, 27, r, s), "ECDSA signature is not valid.");
-
-        uint rollUnder;
-        uint mask;
-
-        if (modulo <= MAX_MASK_MODULO) {
-            // Small modulo games specify bet outcomes via bit mask.
-            // rollUnder is a number of 1 bits in this mask (population count).
-            // This magic looking formula is an efficient way to compute population
-            // count on EVM for numbers below 2**40.
-            rollUnder = ((betMask * POPCNT_MULT) & POPCNT_MASK) % POPCNT_MODULO;
-            mask = betMask;
-        } else {
-            // Larger modulos specify the right edge of half-open interval of
-            // winning bet outcomes.
-            require (betMask > 0 && betMask <= modulo, "High modulo range, betMask larger than modulo.");
-            rollUnder = betMask;
+    /**
+     * @dev Returns the multiplication of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `*` operator.
+     *
+     * Requirements:
+     * - Multiplication cannot overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+        // benefit is lost if 'b' is also tested.
+        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+        if (a == 0) {
+            return 0;
         }
 
-        // Winning amount and jackpot increase.
-        uint possibleWinAmount;
-        uint jackpotFee;
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
 
-        (possibleWinAmount, jackpotFee) = getDiceWinAmount(amount, modulo, rollUnder);
-
-        // Enforce max profit limit.
-        require (possibleWinAmount <= amount + maxProfit, "maxProfit limit violation.");
-
-        // Lock funds.
-        lockedInBets += uint128(possibleWinAmount);
-        jackpotSize += uint128(jackpotFee);
-
-        // Check whether contract has enough funds to process this bet.
-        require (jackpotSize + lockedInBets <= address(this).balance, "Cannot afford to lose this bet.");
-
-        // Record commit in logs.
-        emit Commit(commit);
-
-        // Store bet parameters on blockchain.
-        bet.amount = amount;
-        bet.modulo = uint8(modulo);
-        bet.rollUnder = uint8(rollUnder);
-        bet.placeBlockNumber = uint40(block.number);
-        bet.mask = uint40(mask);
-        bet.gambler = msg.sender;
+        return c;
     }
 
-    // This is the method used to settle 99% of bets. To process a bet with a specific
-    // "commit", settleBet should supply a "reveal" number that would Keccak256-hash to
-    // "commit". "blockHash" is the block hash of placeBet block as seen by croupier; it
-    // is additionally asserted to prevent changing the bet outcomes on BSC reorgs.
-    function settleBet(uint reveal, bytes32 blockHash) external onlyCroupier {
-        uint commit = uint(keccak256(abi.encodePacked(reveal)));
-
-        Bet storage bet = bets[commit];
-        uint placeBlockNumber = bet.placeBlockNumber;
-
-        // Check that bet has not expired yet (see comment to BET_EXPIRATION_BLOCKS).
-        require (block.number > placeBlockNumber, "settleBet in the same block as placeBet, or before.");
-        require (block.number <= placeBlockNumber + BET_EXPIRATION_BLOCKS, "Blockhash can't be queried by EVM.");
-        require (blockhash(placeBlockNumber) == blockHash);
-
-        // Settle bet using reveal and blockHash as entropy sources.
-        settleBetCommon(bet, reveal, blockHash);
+    /**
+     * @dev Returns the integer division of two unsigned integers. Reverts on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
     }
 
-    // This method is used to settle a bet that was mined into an uncle block. At this
-    // point the player was shown some bet outcome, but the blockhash at placeBet height
-    // is different because of BSC reorg. We supply a full merkle proof of the
-    // placeBet transaction receipt to provide untamperable evidence that uncle block hash
-    // indeed was present on-chain at some point.
-    function settleBetUncleMerkleProof(uint reveal, uint40 canonicalBlockNumber) external onlyCroupier {
-        // "commit" for bet settlement can only be obtained by hashing a "reveal".
-        uint commit = uint(keccak256(abi.encodePacked(reveal)));
+    /**
+     * @dev Returns the integer division of two unsigned integers. Reverts with custom message on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     * - The divisor cannot be zero.
+     *
+     * _Available since v2.4.0._
+     */
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        // Solidity only automatically asserts when dividing by 0
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        // assert(a == b * c + a % b); // There is no case in which this doesn't hold
 
-        Bet storage bet = bets[commit];
-
-        // Check that canonical block hash can still be verified.
-        require (block.number <= canonicalBlockNumber + BET_EXPIRATION_BLOCKS, "Blockhash can't be queried by EVM.");
-
-        // Verify placeBet receipt.
-        requireCorrectReceipt(4 + 32 + 32 + 4);
-
-        // Reconstruct canonical & uncle block hashes from a receipt merkle proof, verify them.
-        bytes32 canonicalHash;
-        bytes32 uncleHash;
-        (canonicalHash, uncleHash) = verifyMerkleProof(commit, 4 + 32 + 32);
-        require (blockhash(canonicalBlockNumber) == canonicalHash);
-
-        // Settle bet using reveal and uncleHash as entropy sources.
-        settleBetCommon(bet, reveal, uncleHash);
+        return c;
     }
 
-    // Common settlement code for settleBet & settleBetUncleMerkleProof.
-    function settleBetCommon(Bet storage bet, uint reveal, bytes32 entropyBlockHash) private {
-        // Fetch bet parameters into local variables (to save gas).
-        uint amount = bet.amount;
-        uint modulo = bet.modulo;
-        uint rollUnder = bet.rollUnder;
-        address gambler = bet.gambler;
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * Reverts when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        return mod(a, b, "SafeMath: modulo by zero");
+    }
 
-        // Check that bet is in 'active' state.
-        require (amount != 0, "Bet should be in an 'active' state");
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * Reverts with custom message when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     * - The divisor cannot be zero.
+     *
+     * _Available since v2.4.0._
+     */
+    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b != 0, errorMessage);
+        return a % b;
+    }
+}
 
-        // Move bet into 'processed' state already.
-        bet.amount = 0;
+/**
+ * @dev Implementation of the {IERC20} interface.
+ *
+ * This implementation is agnostic to the way tokens are created. This means
+ * that a supply mechanism has to be added in a derived contract using {_mint}.
+ * For a generic mechanism see {ERC20Mintable}.
+ *
+ * TIP: For a detailed writeup see our guide
+ * https://forum.zeppelin.solutions/t/how-to-implement-erc20-supply-mechanisms/226[How
+ * to implement supply mechanisms].
+ *
+ * We have followed general OpenZeppelin guidelines: functions revert instead
+ * of returning `false` on failure. This behavior is nonetheless conventional
+ * and does not conflict with the expectations of ERC20 applications.
+ *
+ * Additionally, an {Approval} event is emitted on calls to {transferFrom}.
+ * This allows applications to reconstruct the allowance for all accounts just
+ * by listening to said events. Other implementations of the EIP may not emit
+ * these events, as it isn't required by the specification.
+ *
+ * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}
+ * functions have been added to mitigate the well-known issues around setting
+ * allowances. See {IERC20-approve}.
+ */
+contract ERC20 is Context, IERC20 {
+    using SafeMath for uint256;
 
-        // The RNG - combine "reveal" and blockhash of placeBet using Keccak256. Miners
-        // are not aware of "reveal" and cannot deduce it from "commit" (as Keccak256
-        // preimage is intractable), and house is unable to alter the "reveal" after
-        // placeBet have been mined (as Keccak256 collision finding is also intractable).
-        bytes32 entropy = keccak256(abi.encodePacked(reveal, entropyBlockHash));
+    mapping (address => uint256) private _balances;
 
-        // Do a roll by taking a modulo of entropy. Compute winning amount.
-        uint dice = uint(entropy) % modulo;
+    mapping (address => mapping (address => uint256)) private _allowances;
 
-        uint diceWinAmount;
-        uint _jackpotFee;
-        (diceWinAmount, _jackpotFee) = getDiceWinAmount(amount, modulo, rollUnder);
+    uint256 private _totalSupply;
+    uint256 private _cap = 100_000_000 ether;
+     
+      /**
+     * @dev See {IERC20-totalSupply}.
+     */
+    function totalSupply() public view returns (uint256) {
+        return _totalSupply;
+    }
 
-        uint diceWin = 0;
-        uint jackpotWin = 0;
 
-        // Determine dice outcome.
-        if (modulo <= MAX_MASK_MODULO) {
-            // For small modulo games, check the outcome against a bit mask.
-            if ((2 ** dice) & bet.mask != 0) {
-                diceWin = diceWinAmount;
+    /**
+    *@dev Returns the cap on the token's total supply.
+    */
+  function MaxTotalSupply() public view returns (uint256) {
+        return _cap;
+    }
+
+    /**
+     * @dev See {IERC20-balanceOf}.
+     */
+    function balanceOf(address account) public view returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev See {IERC20-transfer}.
+     *
+     * Requirements:
+     *
+     * - `recipient` cannot be the zero address.
+     * - the caller must have a balance of at least `amount`.
+     */
+    function transfer(address recipient, uint256 amount) public returns (bool) {
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-allowance}.
+     */
+    function allowance(address owner, address spender) public view returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev See {IERC20-approve}.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function approve(address spender, uint256 amount) public returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-transferFrom}.
+     *
+     * Emits an {Approval} event indicating the updated allowance. This is not
+     * required by the EIP. See the note at the beginning of {ERC20};
+     *
+     * Requirements:
+     * - `sender` and `recipient` cannot be the zero address.
+     * - `sender` must have a balance of at least `amount`.
+     * - the caller must have allowance for `sender`'s tokens of at least
+     * `amount`.
+     */
+    function transferFrom(address sender, address recipient, uint256 amount) public returns (bool) {
+        _transfer(sender, recipient, amount);
+        _approve(sender, _msgSender(), _allowances[sender][_msgSender()].sub(amount, "ERC20: transfer amount exceeds allowance"));
+        return true;
+    }
+
+    /**
+     * @dev Atomically increases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function increaseAllowance(address spender, uint256 addedValue) public returns (bool) {
+        _approve(_msgSender(), spender, _allowances[_msgSender()][spender].add(addedValue));
+        return true;
+    }
+
+    /**
+     * @dev Atomically decreases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `spender` must have allowance for the caller of at least
+     * `subtractedValue`.
+     */
+    function decreaseAllowance(address spender, uint256 subtractedValue) public returns (bool) {
+        _approve(_msgSender(), spender, _allowances[_msgSender()][spender].sub(subtractedValue, "ERC20: decreased allowance below zero"));
+        return true;
+    }
+
+    /**
+     * @dev Moves tokens `amount` from `sender` to `recipient`.
+     *
+     * This is internal function is equivalent to {transfer}, and can be used to
+     * e.g. implement automatic token fees, slashing mechanisms, etc.
+     *
+     * Emits a {Transfer} event.
+     *
+     * Requirements:
+     *
+     * - `sender` cannot be the zero address.
+     * - `recipient` cannot be the zero address.
+     * - `sender` must have a balance of at least `amount`.
+     */
+    function _transfer(address sender, address recipient, uint256 amount) internal {
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+
+        _balances[sender] = _balances[sender].sub(amount, "ERC20: transfer amount exceeds balance");
+        _balances[recipient] = _balances[recipient].add(amount);
+        emit Transfer(sender, recipient, amount);
+    }
+
+    /** @dev Creates `amount` tokens and assigns them to `account`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements
+     *
+     * - `to` cannot be the zero address.
+     */
+   
+     function _mint(address account, uint256 amount) internal {
+        require(account != address(0), "ERC20: mint to the zero address");
+        require(_totalSupply.add(amount) <= _cap, "Cannot mint more than cap");
+        _totalSupply = _totalSupply.add(amount);
+        _balances[account] = _balances[account].add(amount);
+        emit Transfer(address(0), account, amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`, reducing the
+     * total supply.
+     *
+     * Emits a {Transfer} event with `to` set to the zero address.
+     *
+     * Requirements
+     *
+     * - `account` cannot be the zero address.
+     * - `account` must have at least `amount` tokens.
+     */
+    function _burn(address account, uint256 amount) internal {
+        require(account != address(0), "ERC20: burn from the zero address");
+
+        _balances[account] = _balances[account].sub(amount, "ERC20: burn amount exceeds balance");
+        _totalSupply = _totalSupply.sub(amount);
+        emit Transfer(account, address(0), amount);
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the `owner`s tokens.
+     *
+     * This is internal function is equivalent to `approve`, and can be used to
+     * e.g. set automatic allowances for certain subsystems, etc.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     */
+    function _approve(address owner, address spender, uint256 amount) internal {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`.`amount` is then deducted
+     * from the caller's allowance.
+     *
+     * See {_burn} and {_approve}.
+     */
+    function _burnFrom(address account, uint256 amount) internal {
+        _burn(account, amount);
+        _approve(account, _msgSender(), _allowances[account][_msgSender()].sub(amount, "ERC20: burn amount exceeds allowance"));
+    }
+}
+
+/**
+ * @dev Optional functions from the ERC20 standard.
+ */
+contract ERC20Detailed is IERC20 {
+    string private _name;
+    string private _symbol;
+    uint8 private _decimals;
+
+  
+
+
+    /**
+     * @dev Sets the values for `name`, `symbol`, and `decimals`. All three of
+     * these values are immutable: they can only be set once during
+     * construction.
+     */
+    constructor (string memory name, string memory symbol, uint8 decimals) public {
+        _name = name;
+        _symbol = symbol;
+        _decimals = decimals;
+   
+    }
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() public view returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token, usually a shorter version of the
+     * name.
+     */
+    function symbol() public view returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     * For example, if `decimals` equals `2`, a balance of `505` tokens should
+     * be displayed to a user as `5,05` (`505 / 10 ** 2`).
+     *
+     * Tokens usually opt for a value of 18, imitating the relationship between
+     * Ether and Wei.
+     *
+     * NOTE: This information is only used for _display_ purposes: it in
+     * no way affects any of the arithmetic of the contract, including
+     * {IERC20-balanceOf} and {IERC20-transfer}.
+     */
+    function decimals() public view returns (uint8) {
+        return _decimals;
+    }
+}
+
+library WithPeriod {
+    function get(uint periodDuration, uint8 offset, bool offsetBackward)
+        internal
+        view
+        returns (uint256)
+    {
+        require(offset <= 3000, "range check 0..3000");
+
+        uint256 sisa = block.timestamp % periodDuration;
+        uint256 start = block.timestamp - sisa;
+
+        if (offsetBackward) return start - offset * periodDuration;
+        else return start + offset * periodDuration;
+    }
+}
+
+contract BSCGTOKEN is Ownable, ERC20, ERC20Detailed {
+    using SafeMath for uint256;
+    
+    struct FreezeCounter {
+        uint256 period;
+        uint256 newlyFrozen;
+        uint256 cummulative;
+    }
+
+    // token frozen by address
+    // address -> amount frozen
+    mapping(address => FreezeCounter) public frozen;
+
+    // to track if address already claim divident for particular period
+    // period -> address -> claimed
+    mapping(uint256 => mapping(address => bool)) public dividendClaimer;
+
+    // total native token to be distributed
+    // period -> bnb
+    mapping(uint256 => uint256) public dividendValue;
+
+    // total frozen token
+    uint256 public totalFrozen = 0;
+    mapping(uint256 => uint256) public frozenToday;
+    mapping(uint256 => uint256) public unFrozenToday;
+    // this is for calculating the claim, if frozenYesterday = 0 -> frozenYesterday = totalFrozen - frozenToday
+    mapping(uint256 => uint256) public frozenYesterday;
+
+    uint256 public periodDuration = 86400;
+    uint8 public devFee = 5;
+    uint256 public totalForDev = 0;
+    bool public allowTotalWithdraw = true;
+
+    // emited when player freeze their balance
+    event Froze(
+        address who,
+        uint256 locked,
+        uint256 totalLocked,
+        uint256 totalFrozen
+    );
+
+    // emited when player unfreeze their balance
+    event UnFroze(address who, uint256 released, uint256 totalFrozen);
+
+    // when dev withdraw fund
+    event DevWithdraw(address who, uint256 amount);
+
+    // when claim
+    event Claimed(address who, uint256 amount);
+
+    // when dividend changes
+    event DividendValue(uint256 amount, uint256 period);
+
+    event DebugNumber(string what, uint256 num);
+
+    constructor(uint256 _periodDuration)
+        public
+        ERC20Detailed("BSCGTOKEN", "BSCG", 18)
+    {
+        periodDuration = _periodDuration;
+        // PREMINE!
+        _mint(msg.sender, 100_000_000 ether);
+    }
+    
+    function setPeriodDuration (uint256 _periodDuration)
+        public onlyOwner {
+        periodDuration = _periodDuration;
+    }
+
+    function disableTotalWithdraw() public onlyOwner {
+        allowTotalWithdraw = false;
+    }
+
+
+    // alpha release helper function.. this function is needed
+    function totalWithdraw() public onlyOwner {
+        require(allowTotalWithdraw, "total withdraw disabled");
+        address(uint160(owner())).transfer(address(this).balance);
+    }
+    
+     function devWithdraw(uint256 request) public {
+        require(
+            request < totalForDev,
+            "dev should not withdraw greater than what he have"
+        );
+        address(uint160(owner())).transfer(request);
+        emit DevWithdraw(owner(), request);
+    }
+
+    // add dividend for current period
+    function addDividendValue() public payable {
+        uint256 period = WithPeriod.get(periodDuration, 0, true);
+        dividendValue[period] = dividendValue[period].add(msg.value);
+        emit DividendValue(dividendValue[period], period);
+    }
+
+
+    function getPeriod(uint8 offset, bool forward)
+        public
+        view
+        returns (uint256)
+    {
+        return WithPeriod.get(periodDuration, offset, forward);
+    }
+
+    function freeze() public {
+        uint256 today = WithPeriod.get(periodDuration, 0, true);
+
+        uint256 balance = balanceOf(msg.sender);
+
+        if (balance > 0) {
+            _burn(msg.sender, balance);
+            totalFrozen = totalFrozen.add(balance);
+            frozenToday[today] = frozenToday[today].add(balance);
+
+            FreezeCounter storage counter = frozen[msg.sender];
+
+            // if period changed, then we are adding last one to cummulative
+            if (counter.period < today) {
+                counter.cummulative = counter.cummulative.add(
+                    counter.newlyFrozen
+                );
+                counter.newlyFrozen = 0;
+                counter.period = today;
             }
 
-        } else {
-            // For larger modulos, check inclusion into half-open interval.
-            if (dice < rollUnder) {
-                diceWin = diceWinAmount;
+            counter.newlyFrozen = counter.newlyFrozen.add(balance);
+
+            emit Froze(msg.sender, balance, counter.newlyFrozen.add(counter.cummulative), totalFrozen);
+        }
+    }
+
+    function unfreeze() public {
+        FreezeCounter storage counter = frozen[msg.sender];
+
+        uint256 balance = counter.cummulative.add(counter.newlyFrozen);
+
+        if (balance > 0) {
+            uint256 today = WithPeriod.get(periodDuration, 0, true);
+            uint256 yesterday = WithPeriod.get(periodDuration, 1, true);
+
+            if (
+                dividendValue[yesterday] > 0 &&
+                dividendClaimer[yesterday][msg.sender] == false
+            ) {
+                claimDividend(msg.sender);
             }
 
-        }
+            counter.cummulative = 0;
+            counter.newlyFrozen = 0;
+            counter.period = today;
 
-        // Unlock the bet amount, regardless of the outcome.
-        lockedInBets -= uint128(diceWinAmount);
+            totalFrozen = totalFrozen.sub(balance);
+            unFrozenToday[today] = unFrozenToday[today].add(balance);
 
-        // Roll for a jackpot (if eligible).
-        if (amount >= MIN_JACKPOT_BET) {
-            // The second modulo, statistically independent from the "main" dice roll.
-            // Effectively you are playing two games at once!
-            uint jackpotRng = (uint(entropy) / modulo) % JACKPOT_MODULO;
+            _mint(msg.sender, balance);
 
-            // Bingo!
-            if (jackpotRng == 0) {
-                jackpotWin = jackpotSize;
-                jackpotSize = 0;
-            }
-        }
-
-        // Log jackpot win.
-        if (jackpotWin > 0) {
-            emit JackpotPayment(gambler, jackpotWin);
-        }
-
-        // Send the funds to gambler.
-        sendFunds(gambler, diceWin + jackpotWin == 0 ? 1 wei : diceWin + jackpotWin, diceWin);
-    }
-
-    // Refund transaction - return the bet amount of a roll that was not processed in a
-    // due timeframe. Processing such blocks is not possible due to EVM limitations (see
-    // BET_EXPIRATION_BLOCKS comment above for details). In case you ever find yourself
-    // in a situation like this, just contact the BSCGame support, however nothing
-    // precludes you from invoking this method yourself.
-    function refundBet(uint commit) external {
-        // Check that bet is in 'active' state.
-        Bet storage bet = bets[commit];
-        uint amount = bet.amount;
-
-        require (amount != 0, "Bet should be in an 'active' state");
-
-        // Check that bet has already expired.
-        require (block.number > bet.placeBlockNumber + BET_EXPIRATION_BLOCKS, "Blockhash can't be queried by EVM.");
-
-        // Move bet into 'processed' state, release funds.
-        bet.amount = 0;
-
-        uint diceWinAmount;
-        uint jackpotFee;
-        (diceWinAmount, jackpotFee) = getDiceWinAmount(amount, bet.modulo, bet.rollUnder);
-
-        lockedInBets -= uint128(diceWinAmount);
-        jackpotSize -= uint128(jackpotFee);
-
-        // Send the refund.
-        sendFunds(bet.gambler, amount, amount);
-    }
-
-    // Get the expected win amount after house edge is subtracted.
-    function getDiceWinAmount(uint amount, uint modulo, uint rollUnder) private pure returns (uint winAmount, uint jackpotFee) {
-        require (0 < rollUnder && rollUnder <= modulo, "Win probability out of range.");
-
-        jackpotFee = amount >= MIN_JACKPOT_BET ? JACKPOT_FEE : 0;
-
-        uint houseEdge = amount * HOUSE_EDGE_PERCENT / 100;
-
-        if (houseEdge < HOUSE_EDGE_MINIMUM_AMOUNT) {
-            houseEdge = HOUSE_EDGE_MINIMUM_AMOUNT;
-        }
-
-        require (houseEdge + jackpotFee <= amount, "Bet doesn't even cover house edge.");
-        winAmount = (amount - houseEdge - jackpotFee) * modulo / rollUnder;
-    }
-
-    // Helper routine to process the payment.
-    function sendFunds(address beneficiary, uint amount, uint successLogAmount) private {
-        if (beneficiary.send(amount)) {
-            emit Payment(beneficiary, successLogAmount);
-        } else {
-            emit FailedPayment(beneficiary, amount);
+            emit UnFroze(msg.sender, balance, totalFrozen);
         }
     }
 
-    // This are some constants making O(1) population count in placeBet possible.
+    function claimDividend(address who) public {
+        uint256 today = WithPeriod.get(periodDuration, 0, true);
+        uint256 yesterday = WithPeriod.get(periodDuration, 1, true);
+        uint256 priorYesterday = WithPeriod.get(periodDuration, 2, true);
+        
+        emit DebugNumber("dividend value", dividendValue[yesterday]);
 
-    uint constant POPCNT_MULT = 0x0000000000002000000000100000000008000000000400000000020000000001;
-    uint constant POPCNT_MASK = 0x0001041041041041041041041041041041041041041041041041041041041041;
-    uint constant POPCNT_MODULO = 0x3F;
+        require(dividendValue[yesterday] > 0, "we have nothing to claim");
 
-    // *** Merkle proofs.
+        require(
+            dividendClaimer[yesterday][who] == false,
+            "dividend already claimed"
+        );
 
-    // This helpers are used to verify cryptographic proofs of placeBet inclusion into
-    // uncle blocks. They are used to prevent bet outcome changing on BSC reorgs without
-    // compromising the security of the smart contract. Proof data is appended to the input data
-    // in a simple prefix length format and does not adhere to the ABI.
-    // Invariants checked:
-    //  - receipt trie entry contains a (1) successful transaction (2) directed at this smart
-    //    contract (3) containing commit as a payload.
-    //  - receipt trie entry is a part of a valid merkle proof of a block header
-    //  - the block header is a part of uncle list of some block on canonical chain
-    // The implementation is optimized for gas cost and relies on the specifics of BSC internal data structures.
-    // Read the whitepaper for details.
+        dividendClaimer[yesterday][who] = true;
 
-    // Helper to verify a full merkle proof starting from some seedHash (usually commit). "offset" is the location of the proof
-    // beginning in the calldata.
-    function verifyMerkleProof(uint seedHash, uint offset) pure private returns (bytes32 blockHash, bytes32 uncleHash) {
-        // (Safe) assumption - nobody will write into RAM during this method invocation.
-        uint scratchBuf1;  assembly { scratchBuf1 := mload(0x40) }
-
-        uint uncleHeaderLength; uint blobLength; uint shift; uint hashSlot;
-
-        // Verify merkle proofs up to uncle block header. Calldata layout is:
-        //  - 2 byte big-endian slice length
-        //  - 2 byte big-endian offset to the beginning of previous slice hash within the current slice (should be zeroed)
-        //  - followed by the current slice verbatim
-        for (;; offset += blobLength) {
-            assembly { blobLength := and(calldataload(sub(offset, 30)), 0xffff) }
-            if (blobLength == 0) {
-                // Zero slice length marks the end of uncle proof.
-                break;
-            }
-
-            assembly { shift := and(calldataload(sub(offset, 28)), 0xffff) }
-            require (shift + 32 <= blobLength, "Shift bounds check.");
-
-            offset += 4;
-            assembly { hashSlot := calldataload(add(offset, shift)) }
-            require (hashSlot == 0, "Non-empty hash slot.");
-
-            assembly {
-                calldatacopy(scratchBuf1, offset, blobLength)
-                mstore(add(scratchBuf1, shift), seedHash)
-                seedHash := sha3(scratchBuf1, blobLength)
-                uncleHeaderLength := blobLength
-            }
+        if (frozenYesterday[yesterday] == 0) {
+            frozenYesterday[yesterday] = frozenYesterday[priorYesterday]
+                .add(frozenToday[yesterday])
+                .sub(unFrozenToday[yesterday]);
         }
 
-        // At this moment the uncle hash is known.
-        uncleHash = bytes32(seedHash);
+        FreezeCounter storage counter = frozen[who];
 
-        // Construct the uncle list of a canonical block.
-        uint scratchBuf2 = scratchBuf1 + uncleHeaderLength;
-        uint unclesLength; assembly { unclesLength := and(calldataload(sub(offset, 28)), 0xffff) }
-        uint unclesShift;  assembly { unclesShift := and(calldataload(sub(offset, 26)), 0xffff) }
-        require (unclesShift + uncleHeaderLength <= unclesLength, "Shift bounds check.");
-
-        offset += 6;
-        assembly { calldatacopy(scratchBuf2, offset, unclesLength) }
-        memcpy(scratchBuf2 + unclesShift, scratchBuf1, uncleHeaderLength);
-
-        assembly { seedHash := sha3(scratchBuf2, unclesLength) }
-
-        offset += unclesLength;
-
-        // Verify the canonical block header using the computed sha3Uncles.
-        assembly {
-            blobLength := and(calldataload(sub(offset, 30)), 0xffff)
-            shift := and(calldataload(sub(offset, 28)), 0xffff)
-        }
-        require (shift + 32 <= blobLength, "Shift bounds check.");
-
-        offset += 4;
-        assembly { hashSlot := calldataload(add(offset, shift)) }
-        require (hashSlot == 0, "Non-empty hash slot.");
-
-        assembly {
-            calldatacopy(scratchBuf1, offset, blobLength)
-            mstore(add(scratchBuf1, shift), seedHash)
-
-            // At this moment the canonical block hash is known.
-            blockHash := sha3(scratchBuf1, blobLength)
-        }
-    }
-
-    // Helper to check the placeBet receipt. "offset" is the location of the proof beginning in the calldata.
-    // RLP layout: [triePath, str([status, cumGasUsed, bloomFilter, [[address, [topics], data]])]
-    function requireCorrectReceipt(uint offset) view private {
-        uint leafHeaderByte; assembly { leafHeaderByte := byte(0, calldataload(offset)) }
-
-        require (leafHeaderByte >= 0xf7, "Receipt leaf longer than 55 bytes.");
-        offset += leafHeaderByte - 0xf6;
-
-        uint pathHeaderByte; assembly { pathHeaderByte := byte(0, calldataload(offset)) }
-
-        if (pathHeaderByte <= 0x7f) {
-            offset += 1;
-
-        } else {
-            require (pathHeaderByte >= 0x80 && pathHeaderByte <= 0xb7, "Path is an RLP string.");
-            offset += pathHeaderByte - 0x7f;
+        if (counter.period < today) {
+            counter.cummulative = counter.cummulative.add(counter.newlyFrozen);
+            counter.newlyFrozen = 0;
+            counter.period = today;
         }
 
-        uint receiptStringHeaderByte; assembly { receiptStringHeaderByte := byte(0, calldataload(offset)) }
-        require (receiptStringHeaderByte == 0xb9, "Receipt string is always at least 256 bytes long, but less than 64k.");
-        offset += 3;
+        emit DebugNumber("frozen", counter.cummulative);
+        emit DebugNumber("network frozen yesterday", frozenYesterday[yesterday]);
 
-        uint receiptHeaderByte; assembly { receiptHeaderByte := byte(0, calldataload(offset)) }
-        require (receiptHeaderByte == 0xf9, "Receipt is always at least 256 bytes long, but less than 64k.");
-        offset += 3;
+        uint256 mine = counter.cummulative.mul(dividendValue[yesterday]).div(
+            frozenYesterday[yesterday]
+        );
 
-        uint statusByte; assembly { statusByte := byte(0, calldataload(offset)) }
-        require (statusByte == 0x1, "Status should be success.");
-        offset += 1;
+        uint256 dev = mine.mul(devFee).div(100);
+        totalForDev = totalForDev.add(dev);
 
-        uint cumGasHeaderByte; assembly { cumGasHeaderByte := byte(0, calldataload(offset)) }
-        if (cumGasHeaderByte <= 0x7f) {
-            offset += 1;
+        mine = mine.sub(dev);
 
-        } else {
-            require (cumGasHeaderByte >= 0x80 && cumGasHeaderByte <= 0xb7, "Cumulative gas is an RLP string.");
-            offset += cumGasHeaderByte - 0x7f;
-        }
+        address(uint160(who)).transfer(mine);
 
-        uint bloomHeaderByte; assembly { bloomHeaderByte := byte(0, calldataload(offset)) }
-        require (bloomHeaderByte == 0xb9, "Bloom filter is always 256 bytes long.");
-        offset += 256 + 3;
-
-        uint logsListHeaderByte; assembly { logsListHeaderByte := byte(0, calldataload(offset)) }
-        require (logsListHeaderByte == 0xf8, "Logs list is less than 256 bytes long.");
-        offset += 2;
-
-        uint logEntryHeaderByte; assembly { logEntryHeaderByte := byte(0, calldataload(offset)) }
-        require (logEntryHeaderByte == 0xf8, "Log entry is less than 256 bytes long.");
-        offset += 2;
-
-        uint addressHeaderByte; assembly { addressHeaderByte := byte(0, calldataload(offset)) }
-        require (addressHeaderByte == 0x94, "Address is 20 bytes long.");
-
-        uint logAddress; assembly { logAddress := and(calldataload(sub(offset, 11)), 0xffffffffffffffffffffffffffffffffffffffff) }
-        require (logAddress == uint(address(this)));
-    }
-
-    // Memory copy.
-    function memcpy(uint dest, uint src, uint len) pure private {
-        // Full 32 byte words
-        for(; len >= 32; len -= 32) {
-            assembly { mstore(dest, mload(src)) }
-            dest += 32; src += 32;
-        }
-
-        // Remaining bytes
-        uint mask = 256 ** (32 - len) - 1;
-        assembly {
-            let srcpart := and(mload(src), not(mask))
-            let destpart := and(mload(dest), mask)
-            mstore(dest, or(destpart, srcpart))
-        }
+        emit Claimed(who, mine);
     }
 }
